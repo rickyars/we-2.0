@@ -396,8 +396,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        q = q * 1.15  # sharper attention (split scale between Q and K)
-        k = k * 1.15
+        q = q * 1.2  # sharper attention (split scale between Q and K)
+        k = k * 1.2
 
         q = q.transpose(1, 2)  # (B, H, T, D)
         k = k.transpose(1, 2)  # (B, KVH, T, D)
