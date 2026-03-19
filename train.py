@@ -7,6 +7,7 @@ Usage: uv run train.py
 import argparse
 import gc
 import json
+import math
 import os
 import platform
 import time
@@ -22,7 +23,6 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from prepare import (
-    DATASET_CHOICES,
     EVAL_TOKENS,
     MAX_SEQ_LEN,
     TIME_BUDGET,
@@ -363,7 +363,7 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
+        self.ve_gate_channels = 12
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         self._mask_cache = {}
 
@@ -390,12 +390,14 @@ class CausalSelfAttention(nn.Module):
 
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+        q = q * 1.15  # sharper attention (split scale between Q and K)
+        k = k * 1.15
 
         q = q.transpose(1, 2)  # (B, H, T, D)
         k = k.transpose(1, 2)  # (B, KVH, T, D)
@@ -466,7 +468,7 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, embed_dtype=torch.bfloat16):
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         n_embd = self.config.n_embd
         s = 3 ** 0.5 * n_embd ** -0.5
@@ -475,7 +477,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.5, s * 0.5)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -483,7 +485,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(ve.weight, -s, s)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(
             self.rotary_seq_len,
@@ -557,7 +559,7 @@ class GPT(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+                        weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
@@ -576,10 +578,10 @@ class GPT(nn.Module):
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
-            dict(kind="adamw", params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind="adamw", params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind="adamw", params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            dict(kind="adamw", params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.0),
+            dict(kind="adamw", params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind="adamw", params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind="adamw", params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         muon_group_chunk = 8
@@ -594,7 +596,7 @@ class GPT(nn.Module):
                         lr=matrix_lr,
                         momentum=0.95,
                         ns_steps=5,
-                        beta2=0.95,
+                        beta2=0.9,
                         weight_decay=weight_decay,
                     )
                 )
@@ -610,6 +612,7 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
+        x = 0.9 * x + 0.1 * F.pad(x[:, :-1, :], (0, 0, 1, 0))  # cheap smear: blend with previous token
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -807,7 +810,6 @@ UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04
 SCALAR_LR = 0.5
 WEIGHT_DECAY = 0.2
-ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
@@ -901,7 +903,6 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
             unembedding_lr=UNEMBEDDING_LR,
             embedding_lr=EMBEDDING_LR,
             scalar_lr=SCALAR_LR,
-            adam_betas=ADAM_BETAS,
             matrix_lr=MATRIX_LR,
             weight_decay=WEIGHT_DECAY,
         )
@@ -910,8 +911,6 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
             train_batch_size,
             MAX_SEQ_LEN,
             "train",
-            device=runtime.device,
-            dataset=tokenizer.dataset,
         )
         x, y, _ = next(train_loader)
         torch.cuda.empty_cache()
@@ -1078,7 +1077,6 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         unembedding_lr=UNEMBEDDING_LR,
         embedding_lr=EMBEDDING_LR,
         scalar_lr=SCALAR_LR,
-        adam_betas=ADAM_BETAS,
         matrix_lr=MATRIX_LR,
         weight_decay=WEIGHT_DECAY,
     )
@@ -1089,8 +1087,6 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         device_batch_size,
         MAX_SEQ_LEN,
         "train",
-        device=runtime.device,
-        dataset=tokenizer.dataset,
     )
     x, y, epoch = next(train_loader)
     print(f"Time budget: {TIME_BUDGET}s")
@@ -1109,7 +1105,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         return (1 - frac) * 0.85 + frac * 0.95
 
     def get_weight_decay(progress):
-        return WEIGHT_DECAY * (1 - progress)
+        return WEIGHT_DECAY * 0.5 * (1 + math.cos(math.pi * progress))
 
     target_training_seconds = 10 if smoke_test else TIME_BUDGET
     max_steps = 3 if smoke_test else None
@@ -1217,7 +1213,6 @@ def _restore_gc_after_attempt():
 def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
-    parser.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Optional dataset override.")
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1229,10 +1224,9 @@ def main():
     print(f"TF32: {'enabled' if runtime.tf32_enabled else 'disabled'}")
     print(f"AMP dtype: {runtime.amp_dtype}")
 
-    tokenizer = Tokenizer.from_directory(dataset=args.dataset)
+    tokenizer = Tokenizer.from_directory()
     vocab_size = tokenizer.get_vocab_size()
     print(f"Vocab size: {vocab_size:,}")
-    print(f"Dataset: {tokenizer.dataset}")
 
     # Configure optimizer kernels/dtypes before autotune so probes match real training runtime.
     _configure_step_kernels(runtime)
@@ -1292,7 +1286,6 @@ def main():
     _save_pre_eval_checkpoint(model)
     model.eval()
 
-    eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
     val_bpb = None
     chosen_eval_batch = None
     initial_eval_batch = min(chosen_train_batch, runtime.gpu_profile.eval_batch_cap)
@@ -1305,9 +1298,6 @@ def main():
                     model,
                     tokenizer,
                     eval_batch_size,
-                    device=runtime.device,
-                    dataset=tokenizer.dataset,
-                    eval_tokens=eval_tokens,
                 )
             chosen_eval_batch = eval_batch_size
             print(f"Eval completed with batch_size={eval_batch_size}")
@@ -1353,7 +1343,6 @@ def main():
     print(f"num_steps:        {step}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"depth:            {DEPTH}")
-    print(f"dataset:          {tokenizer.dataset}")
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
