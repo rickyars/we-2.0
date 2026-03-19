@@ -818,11 +818,14 @@ FINAL_LR_FRAC = 0.0
 DEPTH = 8
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
+FORCE_CHECKPOINTING = False  # None=use profile default; False=force off; True=force on
 
 
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
     if use_activation_checkpointing is None:
         use_activation_checkpointing = runtime.use_activation_checkpointing
+    if FORCE_CHECKPOINTING is not None:
+        use_activation_checkpointing = FORCE_CHECKPOINTING
     base_dim = depth * ASPECT_RATIO
     model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
     num_heads = model_dim // HEAD_DIM
@@ -857,8 +860,9 @@ def _filter_train_batch_sizes(candidates):
 
 def _build_train_candidates(runtime):
     batch_sizes = _filter_train_batch_sizes(runtime.gpu_profile.train_batch_candidates)
+    checkpoint_modes = [FORCE_CHECKPOINTING] if FORCE_CHECKPOINTING is not None else list(runtime.gpu_profile.checkpoint_modes)
     candidates = []
-    for checkpointing in runtime.gpu_profile.checkpoint_modes:
+    for checkpointing in checkpoint_modes:
         for batch_size in batch_sizes:
             candidate = (batch_size, checkpointing)
             if candidate not in candidates:
