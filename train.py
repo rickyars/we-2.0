@@ -612,7 +612,7 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        x = 0.9 * x + 0.1 * F.pad(x[:, :-1, :], (0, 0, 1, 0))  # cheap smear: blend with previous token
+        x = 0.85 * x + 0.15 * F.pad(x[:, :-1, :], (0, 0, 1, 0))  # cheap smear: blend with previous token
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
