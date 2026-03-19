@@ -805,7 +805,7 @@ WINDOW_PATTERN = "SSSL"   # sliding window pattern: L=full, S=half context
 MLP_RATIO = 2             # MLP expansion ratio (default 4, 2=faster/smaller)
 
 # Optimization
-TOTAL_BATCH_SIZE = 2 ** 15
+TOTAL_BATCH_SIZE = 2 ** 14
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.02
