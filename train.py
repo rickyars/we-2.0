@@ -812,7 +812,7 @@ SCALAR_LR = 0.5
 WEIGHT_DECAY = 0.2
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.7
-FINAL_LR_FRAC = 0.0
+FINAL_LR_FRAC = 0.05
 
 # Model size + memory defaults
 DEPTH = 8
