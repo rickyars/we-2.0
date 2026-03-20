@@ -329,6 +329,7 @@ class GPTConfig:
     attention_backend: str = "sdpa"
     use_activation_checkpointing: bool = False
     compute_dtype: torch.dtype = torch.bfloat16
+    bos_token_id: int = 0  # used to detect document boundaries for doc masking
 
 
 def norm(x):
@@ -383,7 +384,7 @@ class CausalSelfAttention(nn.Module):
         self._mask_cache[cache_key] = mask
         return mask
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, doc_mask=None):
         B, T, _ = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -404,12 +405,15 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, KVH, T, D)
         v = v.transpose(1, 2)  # (B, KVH, T, D)
         attn_mask = self._get_sdpa_mask(T, window_size, q.device)
+        if doc_mask is not None:
+            # doc_mask: (B, 1, T, T) bool, True = allowed to attend (causal + same-document)
+            attn_mask = doc_mask if attn_mask is None else (attn_mask & doc_mask)
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=attn_mask,
-            is_causal=(attn_mask is None),  # use Flash Attention for full-context layers
+            is_causal=(attn_mask is None),  # Flash Attention only when no explicit mask
             enable_gqa=self.n_kv_head < self.n_head,
         )
         y = y.transpose(1, 2)
@@ -438,8 +442,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, doc_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, doc_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -611,6 +615,13 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
+        # Build document-aware causal mask: tokens only attend within their own document.
+        # doc_ids[b, t] = number of BOS tokens seen up to position t (0-indexed document index).
+        doc_ids = (idx == self.config.bos_token_id).long().cumsum(dim=1)  # (B, T)
+        same_doc = (doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1))         # (B, T, T)
+        causal = torch.ones(T, T, device=idx.device, dtype=torch.bool).tril()
+        doc_mask = (same_doc & causal.unsqueeze(0)).unsqueeze(1)           # (B, 1, T, T)
+
         x = self.transformer.wte(idx)
         x = norm(x)
         x = 0.85 * x + 0.15 * F.pad(x[:, :-1, :], (0, 0, 1, 0))  # cheap smear: blend with previous token
@@ -620,9 +631,9 @@ class GPT(nn.Module):
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             window_size = self.window_sizes[i]
             if self.config.use_activation_checkpointing:
-                x = torch_checkpoint(block, x, ve, cos_sin, window_size, use_reentrant=False)
+                x = torch_checkpoint(block, x, ve, cos_sin, window_size, doc_mask, use_reentrant=False)
             else:
-                x = block(x, ve, cos_sin, window_size)
+                x = block(x, ve, cos_sin, window_size, doc_mask)
         x = norm(x)
 
         logits = self.lm_head(x).float()
@@ -821,7 +832,7 @@ EVAL_BATCH_SIZE = 8
 FORCE_CHECKPOINTING = False  # None=use profile default; False=force off; True=force on
 
 
-def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
+def build_model_config(depth, vocab_size, runtime, bos_token_id=0, use_activation_checkpointing=None):
     if use_activation_checkpointing is None:
         use_activation_checkpointing = runtime.use_activation_checkpointing
     if FORCE_CHECKPOINTING is not None:
@@ -840,6 +851,7 @@ def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=
         attention_backend=runtime.attention_backend,
         use_activation_checkpointing=use_activation_checkpointing,
         compute_dtype=runtime.amp_dtype,
+        bos_token_id=bos_token_id,
     )
 
 
@@ -886,6 +898,7 @@ def _benchmark_train_candidate(runtime, tokenizer, vocab_size, train_batch_size,
         DEPTH,
         vocab_size,
         runtime,
+        bos_token_id=tokenizer.bos_token_id,
         use_activation_checkpointing=use_checkpointing,
     )
     tokens_per_fwdbwd = train_batch_size * MAX_SEQ_LEN
@@ -1250,6 +1263,7 @@ def main():
             DEPTH,
             vocab_size,
             runtime,
+            bos_token_id=tokenizer.bos_token_id,
             use_activation_checkpointing=use_checkpointing,
         )
         print(
