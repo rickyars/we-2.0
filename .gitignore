@@ -22,3 +22,10 @@ dev/
 # Results file
 results.tsv
 run.log
+
+# IDE files
+.claude/
+.vscode/
+
+# Experimental runs
+runs/
