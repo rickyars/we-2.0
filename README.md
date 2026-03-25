@@ -106,6 +106,54 @@ This fork's platform policy is explicit and tiered.
 - Non-goals for this fork include FA3/H100-specialized paths, unofficial Triton-for-Windows stacks, AMD/ROCm, Apple Metal, and multi-GPU training.
 - Default dataset is `karpathy/tinystories_gpt4_clean` for consumer-GPU practicality.
 
+## Dataset
+
+This fork trains on a multi-subreddit personal confession/vent corpus sourced from the [Pushshift Reddit torrent archives](https://academictorrents.com/details/7c0645c94321311bb05bd879ddee4d0eba08aaee) (specifically the `watchful1` Pushshift repack). The following subreddits are included:
+
+| File | Subreddit |
+| --- | --- |
+| `confessions_submissions.zst` | r/confessions |
+| `confession_submissions.zst` | r/confession |
+| `TrueOffMyChest_submissions.zst` | r/TrueOffMyChest |
+| `offmychest_submissions.zst` | r/offmychest |
+| `AmItheAsshole_submissions.zst` | r/AmItheAsshole |
+| `tifu_submissions.zst` | r/tifu |
+
+`extract_torrent.py` extracts and merges these into a single CSV (`watchful1-confessions.csv`). `prepare.py` was updated to handle this dataset:
+- Reads both `title` and `selftext` columns and combines them into a single training document (title + newline + body).
+- NaN values (pandas float) in either column are treated as empty strings.
+- Posts where `selftext` is `[removed]` or `[deleted]` fall back to title only.
+- Posts are filtered to `[10, 10000]` characters after combination.
+- Duplicates are removed before sharding.
+
+## Search strategy
+
+Two search strategies are proposed in `program.md` and `experimental-extensions.md`. They are mutually exclusive — pick one before starting an overnight run.
+
+### Mode 1: Simulated Annealing
+
+The agent loop uses **simulated annealing** to avoid getting stuck in local minima. After each 5-minute run:
+
+1. Computes `delta = val_bpb_new - current_val_bpb`.
+2. Always accepts improvements (`delta < 0`).
+3. For regressions, accepts with probability `P = exp(-delta / T)` — allowing occasional uphill moves.
+4. Decays temperature each experiment: `T = T * 0.97`.
+5. Reheats if stuck: if `no_improve_count >= 15`, resets `T = 0.003`.
+
+State is persisted in `sa_state.json` (untracked by git): `T`, `best_val_bpb`, `current_val_bpb`, `no_improve_count`, `experiment_count`. Initial values: `T=0.005`, everything else 0/inf.
+
+### Mode 2: Population-Based Search
+
+The agent maintains a **top-5 population** of commits rather than a single current best:
+
+1. Each entry stores `{commit, val_bpb, description}`, sorted best to worst.
+2. Parent selection: 60% pick the best, 40% pick randomly from the rest.
+3. The agent `git checkout <parent>` before each modification.
+4. If the result enters the top 5, it is added and the worst is evicted.
+5. Every 20 experiments: attempt a **crossover** — pick two population members, read both diffs vs baseline, and manually combine their changes into a single experiment.
+
+State is persisted in `population.json` (untracked by git).
+
 ## License
 
 MIT
