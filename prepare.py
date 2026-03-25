@@ -38,17 +38,45 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-CORPUS_PATH = os.path.join(os.path.dirname(__file__), "training-data", "one-million-reddit-confessions.csv")
+CORPUS_PATH = os.path.join(os.path.dirname(__file__), "training-data", "watchful1-confessions.csv")
 SHARD_SIZE = 10_000
 VAL_SIZE = 10_000
 VAL_FILENAME = "shard_val.parquet"
-VOCAB_SIZE = 8192
+VOCAB_SIZE = 1024
+
+# Minimum/maximum character length of combined text to keep a post
+MIN_TEXT_LENGTH = 10
+MAX_TEXT_LENGTH = 10000
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
+
+REMOVED_STRINGS = {"[removed]", "[deleted]"}
+
+# ---------------------------------------------------------------------------
+# Text combination logic
+# ---------------------------------------------------------------------------
+
+def combine_text(title, selftext):
+    """
+    Combine title and selftext into a single training document.
+
+    Rules:
+    - If selftext is [removed] or [deleted]: use title only
+    - Otherwise: concatenate title + newline + selftext
+      (if no title, just selftext; if no selftext, just title)
+    """
+    title = ("" if not isinstance(title, str) else title).strip()
+    selftext = ("" if not isinstance(selftext, str) else selftext).strip()
+
+    if selftext in REMOVED_STRINGS:
+        return title
+
+    parts = [p for p in [title, selftext] if p]
+    return "\n".join(parts)
 
 # ---------------------------------------------------------------------------
 # Corpus conversion
@@ -64,11 +92,21 @@ def convert_corpus(num_shards=None):
     os.makedirs(DATA_DIR, exist_ok=True)
 
     print(f"Data: loading {CORPUS_PATH} ...")
-    df = pd.read_csv(CORPUS_PATH, usecols=["selftext"])
-    df = df[df["selftext"].notna()]
-    df = df[~df["selftext"].isin(["[removed]", "[deleted]"])]
-    df = df[df["selftext"].str.len() > 50]
-    df = df.rename(columns={"selftext": "text"})[["text"]]
+    df = pd.read_csv(CORPUS_PATH, usecols=["title", "selftext"])
+
+    # Combine title + selftext per the rules above
+    df["text"] = df.apply(
+        lambda row: combine_text(row.get("title"), row.get("selftext")),
+        axis=1
+    )
+
+    # Filter: remove anything too short to be useful
+    df = df[df["text"].str.len() >= MIN_TEXT_LENGTH]
+    df = df[df["text"].str.len() <= MAX_TEXT_LENGTH]
+    df = df[["text"]]
+
+    # Final dedup and shuffle
+    df = df.drop_duplicates(subset=["text"])
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
     print(f"Data: {len(df):,} rows after filtering")
 

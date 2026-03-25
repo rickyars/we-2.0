@@ -34,6 +34,8 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
 
+**Hardware**: This machine has an RTX 4080 Super with 16GB VRAM, not an H100. Do not attempt to scale model size aggressively. Treat VRAM headroom as a hard practical limit, not a soft one.
+
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
 **The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
@@ -100,10 +102,31 @@ LOOP FOREVER:
 5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+8. Use the simulated annealing strategy below to decide whether to keep or discard.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+## Search strategy
+
+You are using simulated annealing to avoid getting stuck in local minima.
+
+Maintain a file `sa_state.json` (untracked by git) with:
+- `T`: current temperature
+- `best_val_bpb`: best seen so far
+- `current_val_bpb`: val_bpb of the commit you're currently standing on
+- `no_improve_count`: experiments since last improvement
+- `experiment_count`: total experiments run
+
+Initial values: T=0.005, best_val_bpb=inf, current_val_bpb=inf, no_improve_count=0, experiment_count=0
+
+After each run:
+1. Compute delta = val_bpb_new - current_val_bpb
+2. If delta < 0 (improvement): always accept. Update best_val_bpb if new best. Reset no_improve_count=0.
+3. If delta >= 0 (worse): compute P = exp(-delta / T). Generate random float 0-1. If < P, accept anyway (log status as `keep-sa`). Otherwise discard.
+4. Decay: T = T * 0.97 every experiment.
+5. Reheat: if no_improve_count >= 15, set T = 0.003, reset no_improve_count=0.
+6. Save updated sa_state.json.
+
+"Accept" means keep the commit and stand on it for the next experiment.
+"Discard" means git reset to current_val_bpb commit (not necessarily best).
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
