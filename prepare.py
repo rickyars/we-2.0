@@ -16,6 +16,7 @@ import math
 import argparse
 import pickle
 import shutil
+import json
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -27,9 +28,9 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
+MAX_SEQ_LEN = 512       # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+EVAL_TOKENS = 10 * 524288  # was 40, scaled down 4x for MAX_SEQ_LEN=512
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,11 +43,14 @@ CORPUS_PATH = os.path.join(os.path.dirname(__file__), "training-data", "watchful
 SHARD_SIZE = 10_000
 VAL_SIZE = 10_000
 VAL_FILENAME = "shard_val.parquet"
-VOCAB_SIZE = 1024
+VOCAB_SIZE = 8192
 
-# Minimum/maximum character length of combined text to keep a post
-MIN_TEXT_LENGTH = 10
-MAX_TEXT_LENGTH = 10000
+# Minimum and maximum character length of combined text
+MIN_TEXT_LENGTH = 40
+MAX_TEXT_LENGTH = 2000
+
+# Strings indicating deleted/removed content
+REMOVED_STRINGS = {"[removed]", "[deleted]"}
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
@@ -54,29 +58,34 @@ SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| 
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 BOS_TOKEN = "<|reserved_0|>"
 
-REMOVED_STRINGS = {"[removed]", "[deleted]"}
-
 # ---------------------------------------------------------------------------
 # Text combination logic
 # ---------------------------------------------------------------------------
 
 def combine_text(title, selftext):
     """
-    Combine title and selftext into a single training document.
+    Combine title and selftext into a structured JSON training document.
+
+    Format: {"title": "...", "confession": "..."}
 
     Rules:
-    - If selftext is [removed] or [deleted]: use title only
-    - Otherwise: concatenate title + newline + selftext
-      (if no title, just selftext; if no selftext, just title)
+    - If selftext is [removed] or [deleted]: confession field uses title only
+    - Otherwise: title field gets the title, confession field gets selftext
+    - If no title: title field is omitted
     """
-    title = ("" if not isinstance(title, str) else title).strip()
-    selftext = ("" if not isinstance(selftext, str) else selftext).strip()
+    title = (title or "").strip()
+    selftext = (selftext or "").strip()
 
-    if selftext in REMOVED_STRINGS:
-        return title
+    if selftext in REMOVED_STRINGS or not selftext:
+        # Title-only post — confession IS the title
+        if not title:
+            return ""
+        return json.dumps({"confession": title}, ensure_ascii=False)
 
-    parts = [p for p in [title, selftext] if p]
-    return "\n".join(parts)
+    if title:
+        return json.dumps({"title": title, "confession": selftext}, ensure_ascii=False)
+    else:
+        return json.dumps({"confession": selftext}, ensure_ascii=False)
 
 # ---------------------------------------------------------------------------
 # Corpus conversion
@@ -94,18 +103,21 @@ def convert_corpus(num_shards=None):
     print(f"Data: loading {CORPUS_PATH} ...")
     df = pd.read_csv(CORPUS_PATH, usecols=["title", "selftext"])
 
-    # Combine title + selftext per the rules above
+    df["title"] = df["title"].fillna("")
+    df["selftext"] = df["selftext"].fillna("")
+
+    # Combine title + selftext into structured JSON text
     df["text"] = df.apply(
         lambda row: combine_text(row.get("title"), row.get("selftext")),
         axis=1
     )
 
-    # Filter: remove anything too short to be useful
+    # Filter: remove empty, too short, too long
     df = df[df["text"].str.len() >= MIN_TEXT_LENGTH]
     df = df[df["text"].str.len() <= MAX_TEXT_LENGTH]
     df = df[["text"]]
 
-    # Final dedup and shuffle
+    # Deduplicate and shuffle
     df = df.drop_duplicates(subset=["text"])
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
     print(f"Data: {len(df):,} rows after filtering")
@@ -289,13 +301,16 @@ def _document_batches(split, tokenizer_batch_size=128):
 
 def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    One-confession-per-row dataloader.
+    Every row contains exactly one confession, padded with BOS tokens to fill T.
+    This prevents cross-confession context bleed and keeps the model focused on
+    generating coherent single documents.
+
+    Row layout: [BOS] [confession tokens...] [BOS BOS BOS...] (padding)
+    The leading BOS marks document start. Trailing BOS tokens fill unused space.
+    The model learns to predict BOS after a confession ends, signaling completion.
     """
     assert split in ["train", "val"]
-    row_capacity = T + 1
     batches = _document_batches(split)
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
@@ -307,8 +322,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    # Pre-allocate buffers filled with BOS as padding
+    row_buffer = torch.full((B, T + 1), bos_token, dtype=torch.long)
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
@@ -318,32 +333,19 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     while True:
         for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+            # Refill buffer if needed
+            while len(doc_buffer) < buffer_size:
+                refill_buffer()
 
-                remaining = row_capacity - pos
+            # Pop one confession
+            doc = doc_buffer.pop(0)
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+            # Reset row to BOS padding
+            row_buffer[row_idx].fill_(bos_token)
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+            # Write confession into row, truncating if longer than T+1
+            doc_len = min(len(doc), T + 1)
+            row_buffer[row_idx, :doc_len] = torch.tensor(doc[:doc_len], dtype=torch.long)
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])

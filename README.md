@@ -126,6 +126,35 @@ This fork trains on a multi-subreddit personal confession/vent corpus sourced fr
 - Posts are filtered to `[10, 10000]` characters after combination.
 - Duplicates are removed before sharding.
 
+## Sampling the corpus
+
+`sample_corpus.py` lets you inspect the processed training data or the raw CSV without starting a full training run.
+
+```powershell
+# Print 5 random samples from the processed parquet shards (default)
+uv run sample_corpus.py
+
+# Print 10 random samples
+uv run sample_corpus.py --n 10
+
+# Save samples to a file
+uv run sample_corpus.py --n 20 --output samples.txt
+
+# Analyze short posts (under 50 chars) in the processed data
+uv run sample_corpus.py --short
+
+# Adjust the short-post threshold
+uv run sample_corpus.py --short --short-threshold 100 --output short-analysis.txt
+
+# Sample from the raw CSV instead of parquet shards
+uv run sample_corpus.py --source csv --csv "E:/projects/we-2.0/training-data/watchful1-confessions.csv"
+
+# Sample a specific subreddit from the raw CSV
+uv run sample_corpus.py --source csv --csv "E:/projects/we-2.0/training-data/watchful1-confessions.csv" --subreddit confession --n 10
+```
+
+> Note: `--subreddit` filtering is only available in `--source csv` mode. Parquet shards don't retain the subreddit column.
+
 ## Search strategy
 
 Two search strategies are proposed in `program.md` and `experimental-extensions.md`. They are mutually exclusive — pick one before starting an overnight run.

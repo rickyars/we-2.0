@@ -122,7 +122,7 @@ After each run:
 2. If delta < 0 (improvement): always accept. Update best_val_bpb if new best. Reset no_improve_count=0.
 3. If delta >= 0 (worse): compute P = exp(-delta / T). Generate random float 0-1. If < P, accept anyway (log status as `keep-sa`). Otherwise discard.
 4. Decay: T = T * 0.97 every experiment.
-5. Reheat: if no_improve_count >= 15, set T = 0.003, reset no_improve_count=0.
+5. Reheat: if no_improve_count >= 10, set T = 0.003, reset no_improve_count=0.
 6. Save updated sa_state.json.
 
 "Accept" means keep the commit and stand on it for the next experiment.
